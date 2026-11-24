@@ -1,0 +1,67 @@
+{
+	"PiPLs" :
+	[
+		{
+			"Kind":"Format",
+			"Version":1,
+			"SubVersion":0,
+			"Name":"Sony HIF",
+			"NoAboutBox":false,
+			"ComponentVersionShortNum":27,
+			"ComponentVersionMinorRevNum":0,
+			"ComponentVersionDotRevNum":0,
+			"ComponentName":"Sony HIF",
+			"CodeEntryPointWin64":"PluginMain",
+			"SupportsPOSIXIO":false,
+			"MonitorScalingAware":true,
+			"SupportedModes":
+			{
+				"RGBColor":true
+			},
+			"EnableInfo":"true",
+			"PlugInMaxSize":[2147483647,2147483647],
+			"FormatMaxSize":[32767,32767],
+			"FormatMaxChannels":
+			[
+				1, 1, 1, 4, 4, 4, 4, 4, 4, 4, 4, 4
+			],
+			"FmtFileType":
+			{
+				"Type":"HIF ",
+				"Creator":"8BIM"
+			},
+			"ReadTypes":
+			[
+				{
+					"Type":"HIF ",
+					"Creator":"    "
+				}
+			],
+			"ReadExtensions":
+			[
+				"HIF "
+			],
+			"FilteredExtensions":
+			[
+				"HIF "
+			],
+			"FormatFlags":
+			{
+				"SavesImageResources":false,
+				"CanRead":true,
+				"CanWrite":false,
+				"CanWriteIfRead":false,
+				"CanWriteTransparency":false,
+				"CanCreateThumbnail":true
+			},
+			"FormatICCFlags":
+			{
+				"CanEmbedGray":false,
+				"CanEmbedIndexed":false,
+				"CanEmbedRGB":true,
+				"CanEmbedCMYK":false
+			},
+			"FileProperties":true
+		}
+	]
+}

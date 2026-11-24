@@ -1,0 +1,34 @@
+# Build outputs & local SDK / sample files
+**/target/
+**/build/
+build/
+dist/
+sdk/
+
+# Compiled binaries & resources
+*.exe
+*.dll
+*.8bi
+*.lib
+*.a
+*.o
+*.obj
+*.res
+*.pdb
+
+# Sample images & archives
+*.zip
+*.HIF
+*.hif
+*.HEIC
+*.heic
+*.avif
+*.AVIF
+*.png
+*.jpg
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vs/
