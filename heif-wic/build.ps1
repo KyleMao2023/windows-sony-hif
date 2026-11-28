@@ -58,4 +58,14 @@ if ($LASTEXITCODE -ne 0) { throw "test_heif_local.exe link failed ($LASTEXITCODE
     -lwindowscodecs -lole32 -luuid
 if ($LASTEXITCODE -ne 0) { throw "verify_heif_wic.exe link failed ($LASTEXITCODE)" }
 
+$exportOut = Join-Path $buildDir 'heif_export.exe'
+& $gxxExe -O2 -std=c++17 -finput-charset=UTF-8 -municode -mwindows `
+    (Join-Path $root 'heif_export.cpp') `
+    $rustLib `
+    -o $exportOut `
+    -static -static-libgcc -static-libstdc++ `
+    -lwindowscodecs -lole32 -loleaut32 -luuid -lshell32 -lws2_32 -luserenv -lbcrypt -lntdll -lsynchronization
+if ($LASTEXITCODE -ne 0) { throw "heif_export.exe link failed ($LASTEXITCODE)" }
+
 Write-Host "Built: $dllOut" -ForegroundColor Green
+Write-Host "Built: $exportOut" -ForegroundColor Green

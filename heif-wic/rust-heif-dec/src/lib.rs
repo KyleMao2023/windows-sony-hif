@@ -61,10 +61,50 @@ fn hlg_lut() -> &'static [f32] {
     })
 }
 
+pub const HEIF_TONEMAP_REINHARD: u32 = 0;
+pub const HEIF_TONEMAP_ACES_FILMIC: u32 = 1;
+
+pub const HEIF_GAMUT_DISPLAY_P3: u32 = 0;
+pub const HEIF_GAMUT_SRGB: u32 = 1;
+
 const BT2020_TO_DISPLAY_P3: [[f32; 3]; 3] = [
     [1.3435783, -0.2821797, -0.0613986],
     [-0.0652975, 1.0757879, -0.0104905],
     [0.0028218, -0.0195985, 1.0167767],
+];
+
+// ITU-R BT.2087 linear BT.2020 (D65) -> Rec.709 / sRGB (D65)
+const BT2020_TO_SRGB: [[f32; 3]; 3] = [
+    [1.6604910, -0.5876411, -0.0728499],
+    [-0.1245505, 1.1328999, -0.0083494],
+    [-0.0181508, -0.1005789, 1.1187297],
+];
+
+// Linear Display P3 (D65) -> Rec.709 / sRGB (D65)
+const DISPLAY_P3_TO_SRGB: [[f32; 3]; 3] = [
+    [1.2249401, -0.2249401, 0.0000000],
+    [-0.0420569, 1.0420569, 0.0000000],
+    [-0.0196376, -0.0786361, 1.0982737],
+];
+
+// Stephen Hill / BakingLab ACES Fitted matrices (linear sRGB/Rec.709 <-> AP1-like working space)
+const ACES_INPUT_MAT: [[f32; 3]; 3] = [
+    [0.59719, 0.35458, 0.04823],
+    [0.07600, 0.90834, 0.01566],
+    [0.02840, 0.13383, 0.83777],
+];
+
+const ACES_OUTPUT_MAT: [[f32; 3]; 3] = [
+    [1.60475, -0.53108, -0.07367],
+    [-0.10208, 1.10813, -0.00605],
+    [-0.00327, -0.07276, 1.07602],
+];
+
+// Linear Rec.709 / sRGB (D65) -> Display P3 (D65)
+const SRGB_TO_DISPLAY_P3: [[f32; 3]; 3] = [
+    [0.8224621, 0.1775380, 0.0000000],
+    [0.0331942, 0.9668058, 0.0000000],
+    [0.0170826, 0.0723974, 0.9105199],
 ];
 
 // Zero-mean 4x4 Bayer ordered dithering offsets in [-15/32, +15/32] LSB.
@@ -104,13 +144,58 @@ fn dither_to_u8(val_255: f32, dither: f32) -> u8 {
 }
 
 #[inline(always)]
-fn bt2020_to_display_p3_linear(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
-    let m = &BT2020_TO_DISPLAY_P3;
+fn apply_mat3(m: &[[f32; 3]; 3], r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     (
-        (m[0][0] * r + m[0][1] * g + m[0][2] * b).clamp(0.0, 1.0),
-        (m[1][0] * r + m[1][1] * g + m[1][2] * b).clamp(0.0, 1.0),
-        (m[2][0] * r + m[2][1] * g + m[2][2] * b).clamp(0.0, 1.0),
+        m[0][0] * r + m[0][1] * g + m[0][2] * b,
+        m[1][0] * r + m[1][1] * g + m[1][2] * b,
+        m[2][0] * r + m[2][1] * g + m[2][2] * b,
     )
+}
+
+#[inline(always)]
+fn convert_primaries_to_srgb_unclamped(cp: u16, r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    match cp {
+        9 => apply_mat3(&BT2020_TO_SRGB, r, g, b),
+        12 => apply_mat3(&DISPLAY_P3_TO_SRGB, r, g, b),
+        _ => (r, g, b),
+    }
+}
+
+#[inline(always)]
+fn convert_primaries_linear(cp: u16, target_gamut: u32, r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let (or, og, ob) = if target_gamut == HEIF_GAMUT_SRGB {
+        convert_primaries_to_srgb_unclamped(cp, r, g, b)
+    } else if cp == 9 {
+        apply_mat3(&BT2020_TO_DISPLAY_P3, r, g, b)
+    } else {
+        (r, g, b)
+    };
+    (or.clamp(0.0, 1.0), og.clamp(0.0, 1.0), ob.clamp(0.0, 1.0))
+}
+
+#[inline(always)]
+fn rrt_and_odt_fit(v: f32) -> f32 {
+    let v = v.max(0.0);
+    let a = v * (v + 0.0245786) - 0.000090537;
+    let b = v * (0.983729 * v + 0.4329510) + 0.238081;
+    a / b
+}
+
+#[inline(always)]
+fn aces_filmic_tone_map(cp: u16, target_gamut: u32, r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    // Convert source wide gamut directly to AP1 without intermediate gamut clipping
+    let (r709, g709, b709) = convert_primaries_to_srgb_unclamped(cp, r, g, b);
+    let (ar, ag, ab) = apply_mat3(&ACES_INPUT_MAT, r709, g709, b709);
+    let tr = rrt_and_odt_fit(ar);
+    let tg = rrt_and_odt_fit(ag);
+    let tb = rrt_and_odt_fit(ab);
+    let (sr, sg, sb) = apply_mat3(&ACES_OUTPUT_MAT, tr, tg, tb);
+    if target_gamut == HEIF_GAMUT_DISPLAY_P3 {
+        let (pr, pg, pb) = apply_mat3(&SRGB_TO_DISPLAY_P3, sr.max(0.0), sg.max(0.0), sb.max(0.0));
+        (pr.clamp(0.0, 1.0), pg.clamp(0.0, 1.0), pb.clamp(0.0, 1.0))
+    } else {
+        (sr.clamp(0.0, 1.0), sg.clamp(0.0, 1.0), sb.clamp(0.0, 1.0))
+    }
 }
 
 // Build a standard ICC v4.0 RGB matrix+TRC profile (D50 PCS, Bradford D65->D50, mluc, sRGB para).
@@ -263,6 +348,19 @@ fn display_p3_icc_profile() -> &'static [u8] {
     })
 }
 
+fn srgb_icc_profile() -> &'static [u8] {
+    static ICC: OnceLock<Vec<u8>> = OnceLock::new();
+    ICC.get_or_init(|| {
+        // Bradford D65->D50 adapted sRGB (IEC 61966-2-1) primaries summing exactly to D50_ICC
+        build_icc_v4(
+            "sRGB IEC61966-2.1",
+            [28578, 14582, 912],
+            [25235, 46981, 6362],
+            [9377, 3973, 46787],
+        )
+    })
+}
+
 fn to_rgba16_with_fallback(img: &DecodedImage, ci_opt: Option<ColorInfo>) -> Option<heic_decoder::RgbaImage<u16>> {
     img.to_rgba16()
         .or_else(|_| {
@@ -296,9 +394,14 @@ fn srgb_to_linear(v: f32) -> f32 {
     }
 }
 
-/// Apply HDR tone-mapping (HLG / PQ) in native wide primaries, convert BT.2020 to Display P3,
-/// encode with sRGB TRC and 4x4 Bayer ordered dithering, and output 8-bit/ch BGRA8 (32bppBGRA).
-fn tone_map_hdr_to_bgra8(img: &DecodedImage, ci: ColorInfo) -> Option<(u32, u32, Vec<u8>)> {
+/// Apply HDR tone-mapping (HLG / PQ) with Reinhard or ACES Filmic, convert gamut to target
+/// (Display P3 or sRGB), encode with sRGB TRC and 4x4 Bayer ordered dithering -> 32bppBGRA.
+fn tone_map_hdr_to_bgra8(
+    img: &DecodedImage,
+    ci: ColorInfo,
+    tone_map: u32,
+    target_gamut: u32,
+) -> Option<(u32, u32, Vec<u8>)> {
     let rgba16 = to_rgba16_with_fallback(img, Some(ci))?;
     let w = rgba16.width as u32;
     let h = rgba16.height as u32;
@@ -311,7 +414,7 @@ fn tone_map_hdr_to_bgra8(img: &DecodedImage, ci: ColorInfo) -> Option<(u32, u32,
     } else {
         (0.2126_f32, 0.7152_f32, 0.0722_f32)
     };
-    let convert_2020_to_p3 = cp == 9;
+    let use_aces = tone_map == HEIF_TONEMAP_ACES_FILMIC;
 
     let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
     const INV_65535: f32 = 1.0 / 65535.0;
@@ -331,44 +434,23 @@ fn tone_map_hdr_to_bgra8(img: &DecodedImage, ci: ColorInfo) -> Option<(u32, u32,
                 let a16 = src[3];
                 let no_premul = !(premul && a16 > 0 && a16 < 65535);
 
-                let (mut lr, mut lg, mut lb) = match tc {
-                    // HLG -> scene linear -> extended Reinhard shoulder in native gamut
+                let (sr, sg, sb, is_hlg) = match tc {
                     18 if no_premul => {
                         let tbl = hlg_table.unwrap();
-                        let sr = tbl[src[0] as usize];
-                        let sg = tbl[src[1] as usize];
-                        let sb = tbl[src[2] as usize];
-                        let y_lum = yr * sr + yg * sg + yb * sb;
-                        if y_lum > 1e-7 {
-                            const GAIN: f32 = 4.8;
-                            let l = y_lum * GAIN;
-                            let l_out = l * (1.0 + l / (GAIN * GAIN)) / (1.0 + l);
-                            let s = l_out / y_lum;
-                            (sr * s, sg * s, sb * s)
-                        } else {
-                            (0.0, 0.0, 0.0)
-                        }
+                        (
+                            tbl[src[0] as usize],
+                            tbl[src[1] as usize],
+                            tbl[src[2] as usize],
+                            true,
+                        )
                     }
                     18 => {
                         let af = a16 as f32 * INV_65535;
                         let r = (src[0] as f32 * INV_65535 / af).min(1.0);
                         let g = (src[1] as f32 * INV_65535 / af).min(1.0);
                         let b = (src[2] as f32 * INV_65535 / af).min(1.0);
-                        let sr = hlg_inv_oetf(r);
-                        let sg = hlg_inv_oetf(g);
-                        let sb = hlg_inv_oetf(b);
-                        let y_lum = yr * sr + yg * sg + yb * sb;
-                        if y_lum > 1e-7 {
-                            const GAIN: f32 = 4.8;
-                            let l = y_lum * GAIN;
-                            let l_out = l * (1.0 + l / (GAIN * GAIN)) / (1.0 + l);
-                            let s = l_out / y_lum;
-                            (sr * s, sg * s, sb * s)
-                        } else {
-                            (0.0, 0.0, 0.0)
-                        }
+                        (hlg_inv_oetf(r), hlg_inv_oetf(g), hlg_inv_oetf(b), true)
                     }
-                    // PQ -> SDR normalized -> extended Reinhard shoulder in native gamut
                     16 => {
                         let mut r = src[0] as f32 * INV_65535;
                         let mut g = src[1] as f32 * INV_65535;
@@ -379,25 +461,39 @@ fn tone_map_hdr_to_bgra8(img: &DecodedImage, ci: ColorInfo) -> Option<(u32, u32,
                             g = (g / af).min(1.0);
                             b = (b / af).min(1.0);
                         }
-                        let sr = pq_eotf_sdr_norm(r);
-                        let sg = pq_eotf_sdr_norm(g);
-                        let sb = pq_eotf_sdr_norm(b);
-                        let y_lum = yr * sr + yg * sg + yb * sb;
-                        if y_lum > 1e-7 {
-                            const WHITE: f32 = 5.0;
-                            let l_out = y_lum * (1.0 + y_lum / (WHITE * WHITE)) / (1.0 + y_lum);
-                            let s = l_out / y_lum;
-                            (sr * s, sg * s, sb * s)
-                        } else {
-                            (0.0, 0.0, 0.0)
-                        }
+                        (
+                            pq_eotf_sdr_norm(r),
+                            pq_eotf_sdr_norm(g),
+                            pq_eotf_sdr_norm(b),
+                            false,
+                        )
                     }
                     _ => unreachable!(),
                 };
 
-                if convert_2020_to_p3 {
-                    (lr, lg, lb) = bt2020_to_display_p3_linear(lr, lg, lb);
-                }
+                let (lr, lg, lb) = if use_aces {
+                    let gain = if is_hlg { 4.8_f32 } else { 1.15_f32 };
+                    aces_filmic_tone_map(cp, target_gamut, sr * gain, sg * gain, sb * gain)
+                } else {
+                    let y_lum = yr * sr + yg * sg + yb * sb;
+                    let (tr, tg, tb) = if y_lum > 1e-7 {
+                        if is_hlg {
+                            const GAIN: f32 = 4.8;
+                            let l = y_lum * GAIN;
+                            let l_out = l * (1.0 + l / (GAIN * GAIN)) / (1.0 + l);
+                            let s = l_out / y_lum;
+                            (sr * s, sg * s, sb * s)
+                        } else {
+                            const WHITE: f32 = 5.0;
+                            let l_out = y_lum * (1.0 + y_lum / (WHITE * WHITE)) / (1.0 + y_lum);
+                            let s = l_out / y_lum;
+                            (sr * s, sg * s, sb * s)
+                        }
+                    } else {
+                        (0.0, 0.0, 0.0)
+                    };
+                    convert_primaries_linear(cp, target_gamut, tr, tg, tb)
+                };
 
                 let d = bayer_row[x & 3];
                 dst[0] = dither_to_u8(linear_to_srgb_f255_fast(srgb_table, lb), d);
@@ -411,10 +507,11 @@ fn tone_map_hdr_to_bgra8(img: &DecodedImage, ci: ColorInfo) -> Option<(u32, u32,
 }
 
 /// Convert high-bit-depth RGBA16 to dithered 8-bit/ch BGRA8 (32bppBGRA).
-/// If `convert_2020_to_p3` is true (SDR BT.2020 without embedded ICC), maps primaries to Display P3.
+/// When `src_cp` requires a primaries transform into `target_gamut`, converts in linear light.
 fn rgba16_to_bgra8_dithered(
     rgba: &heic_decoder::RgbaImage<u16>,
-    convert_2020_to_p3: bool,
+    src_cp: Option<u16>,
+    target_gamut: u32,
 ) -> Vec<u8> {
     let w = rgba.width as usize;
     let h = rgba.height as usize;
@@ -422,11 +519,17 @@ fn rgba16_to_bgra8_dithered(
     let premul = rgba.premultiplied;
     const SCALE_255: f32 = 255.0 / 65535.0;
     const INV_65535: f32 = 1.0 / 65535.0;
-    let srgb_table = if convert_2020_to_p3 {
+    let needs_gamut_convert = match (src_cp, target_gamut) {
+        (Some(9), _) => true,
+        (Some(12), HEIF_GAMUT_SRGB) => true,
+        _ => false,
+    };
+    let srgb_table = if needs_gamut_convert {
         Some(srgb_sqrt_lut_255())
     } else {
         None
     };
+    let cp_val = src_cp.unwrap_or(1);
 
     out.par_chunks_exact_mut(w * 4)
         .zip(rgba.data.par_chunks_exact(w * 4))
@@ -450,7 +553,7 @@ fn rgba16_to_bgra8_dithered(
                     let lr = srgb_to_linear(r_u16 as f32 * INV_65535);
                     let lg = srgb_to_linear(g_u16 as f32 * INV_65535);
                     let lb = srgb_to_linear(b_u16 as f32 * INV_65535);
-                    let (pr, pg, pb) = bt2020_to_display_p3_linear(lr, lg, lb);
+                    let (pr, pg, pb) = convert_primaries_linear(cp_val, target_gamut, lr, lg, lb);
                     dst[0] = dither_to_u8(linear_to_srgb_f255_fast(tbl, pb), d);
                     dst[1] = dither_to_u8(linear_to_srgb_f255_fast(tbl, pg), d);
                     dst[2] = dither_to_u8(linear_to_srgb_f255_fast(tbl, pr), d);
@@ -466,9 +569,11 @@ fn rgba16_to_bgra8_dithered(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn heif_wic_decode(
+pub unsafe extern "C" fn heif_wic_decode_ex(
     input_ptr: *const u8,
     input_len: usize,
+    tone_map: u32,
+    target_gamut: u32,
     out: *mut HeifWicDecoded,
 ) -> i32 {
     if input_ptr.is_null() || input_len == 0 || out.is_null() {
@@ -495,26 +600,39 @@ pub unsafe extern "C" fn heif_wic_decode(
         None
     };
 
+    let needs_sdr_gamut_convert = match (cp_no_icc, target_gamut) {
+        (Some(9), _) => true,
+        (Some(12), HEIF_GAMUT_SRGB) => true,
+        _ => false,
+    };
+
     let (w, h, bpc_out, mut bgra, synthesized_icc): (u32, u32, u32, Vec<u8>, Option<&'static [u8]>) =
         if is_hdr_tc {
             let ci = ci_opt.unwrap();
-            let Some((w, h, buf)) = tone_map_hdr_to_bgra8(&img, ci) else {
+            let Some((w, h, buf)) = tone_map_hdr_to_bgra8(&img, ci, tone_map, target_gamut) else {
                 return -3;
             };
-            let icc = match ci.color_primaries {
-                9 | 12 => Some(display_p3_icc_profile()),
-                _ => None,
+            let icc = if target_gamut == HEIF_GAMUT_SRGB {
+                Some(srgb_icc_profile())
+            } else {
+                match ci.color_primaries {
+                    9 | 12 => Some(display_p3_icc_profile()),
+                    _ => None,
+                }
             };
             (w, h, 8, buf, icc)
-        } else if is_high_bpc || cp_no_icc == Some(9) {
+        } else if is_high_bpc || needs_sdr_gamut_convert {
             let Some(rgba16) = to_rgba16_with_fallback(&img, ci_opt) else {
                 return -3;
             };
-            let convert_2020_to_p3 = cp_no_icc == Some(9);
-            let buf = rgba16_to_bgra8_dithered(&rgba16, convert_2020_to_p3);
-            let icc = match cp_no_icc {
-                Some(9) | Some(12) => Some(display_p3_icc_profile()),
-                _ => None,
+            let buf = rgba16_to_bgra8_dithered(&rgba16, cp_no_icc, target_gamut);
+            let icc = if target_gamut == HEIF_GAMUT_SRGB {
+                Some(srgb_icc_profile())
+            } else {
+                match cp_no_icc {
+                    Some(9) | Some(12) => Some(display_p3_icc_profile()),
+                    _ => None,
+                }
             };
             (rgba16.width as u32, rgba16.height as u32, 8, buf, icc)
         } else {
@@ -567,9 +685,13 @@ pub unsafe extern "C" fn heif_wic_decode(
                 }
             }
 
-            let icc = match cp_no_icc {
-                Some(12) => Some(display_p3_icc_profile()),
-                _ => None,
+            let icc = if target_gamut == HEIF_GAMUT_SRGB {
+                Some(srgb_icc_profile())
+            } else {
+                match cp_no_icc {
+                    Some(12) => Some(display_p3_icc_profile()),
+                    _ => None,
+                }
             };
             (w, h, 8, rgba.data, icc)
         };
@@ -601,6 +723,21 @@ pub unsafe extern "C" fn heif_wic_decode(
     };
 
     0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn heif_wic_decode(
+    input_ptr: *const u8,
+    input_len: usize,
+    out: *mut HeifWicDecoded,
+) -> i32 {
+    heif_wic_decode_ex(
+        input_ptr,
+        input_len,
+        HEIF_TONEMAP_REINHARD,
+        HEIF_GAMUT_DISPLAY_P3,
+        out,
+    )
 }
 
 #[no_mangle]

@@ -16,6 +16,26 @@
 - **标准 ICC v4 嵌入**：内嵌通过 Windows WCS/D2D 校验的 **Display P3 ICC v4** 描述文件（完整 `desc`、`text`、`para` sRGB TRC 标签）。
 - **元数据与方向**：解析 `Exif` 块中的方向（Orientation）并通过 `IWICMetadataQueryReader` 暴露给系统，保证竖拍照片在资源管理器与照片应用中自动摆正。
 
+## 右键菜单快速导出 sRGB JPG（`heif_export.exe`）
+
+安装完成后，对 `.hif` / `.heif` / `.heic` 文件右键（Windows 11 默认菜单下在 **「显示更多选项」** 或直接 **`Shift + 右键`**），即可看到 **「导出为 sRGB JPG」** 级联子菜单，内置 **2 × 3 = 6** 个预设：
+
+- **Reinhard - 原图 (100%)** → `<原名>_reinhard.jpg`（自然通透、暗部细节丰富）
+- **Reinhard - 50%** → `<原名>_reinhard_50.jpg`
+- **Reinhard - 25%** → `<原名>_reinhard_25.jpg`（适合发微信/即时分享）
+- **ACES Filmic - 原图 (100%)** → `<原名>_aces.jpg`（电影感 S 曲线、对比更扎实）
+- **ACES Filmic - 50%** → `<原名>_aces_50.jpg`
+- **ACES Filmic - 25%** → `<原名>_aces_25.jpg`
+
+特性说明：
+- 全流程基于现有 Rust 解码静态库 + Windows WIC Fant 抗锯齿缩放与 JPEG 编码（`quality=92`），60MP 原图单张耗时约 **1.1～1.3 秒**，无控制台黑框闪烁；
+- 像素直接转换为标准 **sRGB** 色域并附带轻量 `sRGB IEC61966-2.1` ICC v4，发微信或在其他设备查看不偏色、不发灰；
+- 支持多选批量导出（内置互斥锁排队，避免多进程并发争抢内存与 CPU）；
+- 亦支持命令行调用：
+  ```powershell
+  "C:\Program Files\CustomHeifWic\heif_export.exe" --tonemap aces --scale 50 --quality 92 "DSC06556.HIF"
+  ```
+
 ## 安装与卸载
 
 ### 安装（管理员权限 PowerShell）
@@ -26,9 +46,9 @@
 
 `install.ps1` 会执行：
 1. 结束可能占用旧 DLL 的 `Photos` 进程；
-2. 将 `heif_wic.dll` 复制到 `C:\Program Files\CustomHeifWic\heif_wic.dll`；
+2. 将 `heif_wic.dll` 与 `heif_export.exe` 复制到 `C:\Program Files\CustomHeifWic\`；
 3. 为 `ALL APPLICATION PACKAGES`（`*S-1-15-2-1`）授予读取与执行权限，使 UWP 版“微软照片”能够正常加载该 COM 组件；
-4. 调用 `regsvr32.exe /s` 注册 WIC 解码器。
+4. 调用 `regsvr32.exe /s` 注册 WIC 解码器，并调用 `heif_export.exe --register-menu` 为 `.hif` / `.heif` / `.heic` 注册右键导出子菜单（加 `-SkipContextMenu` 可跳过菜单注册）。
 
 如需验证系统是否已优先选中本解码器：
 
@@ -42,7 +62,7 @@
 .\uninstall.ps1
 ```
 
-会反注册 COM 组件并删除 `C:\Program Files\CustomHeifWic`。（若资源管理器仍占用 DLL 句柄，重启资源管理器或重启电脑后再删目录即可。）
+会清理 `.hif` / `.heif` / `.heic` 的右键导出子菜单、反注册 COM 组件并删除 `C:\Program Files\CustomHeifWic`。（若资源管理器仍占用 DLL 句柄，重启资源管理器或重启电脑后再删目录即可。）
 
 ## 修改与从源码编译
 
@@ -50,9 +70,10 @@
 .\build.ps1
 ```
 
-产物生成在 `build\heif_wic.dll`、本地加载验证工具 `build\test_heif_local.exe` 以及系统仲裁检查工具 `build\verify_heif_wic.exe`。
+产物生成在 `build\heif_wic.dll`、右键导出工具 `build\heif_export.exe`、本地加载验证工具 `build\test_heif_local.exe` 以及系统仲裁检查工具 `build\verify_heif_wic.exe`。
 
 ### 常见二次开发入口
 
-- **Tone Mapping 曲线与输出色域**：`rust-heif-dec/src/lib.rs`（可修改 `GAIN`、替换为 BT.2390/ACES/AgX，或切换目标 ICC 与色域矩阵）。
+- **Tone Mapping 曲线与输出色域**：`rust-heif-dec/src/lib.rs`（`heif_wic_decode_ex` 支持 Reinhard / ACES Filmic 及 Display P3 / sRGB）。
+- **右键导出预设与缩放/画质**：`heif_export.cpp`（默认 JPEG 质量 `0.92f`、菜单注册逻辑 `RegisterContextMenu`）。
 - **接管的后缀与优先级**：`heif_wic.cpp`（`DllRegisterServer` 注册表项与 `QueryCapability`）。

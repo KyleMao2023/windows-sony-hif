@@ -34,6 +34,7 @@ function New-ReleaseZip([string]$zipPath, [string]$stagingName, [hashtable]$file
 
 New-ReleaseZip (Join-Path $distDir "sony-heif-windows-wic-$Version-win64.zip") 'wic' @{
     'heif_wic.dll'        = Join-Path $root 'heif-wic\build\heif_wic.dll'
+    'heif_export.exe'     = Join-Path $root 'heif-wic\build\heif_export.exe'
     'verify_heif_wic.exe' = Join-Path $root 'heif-wic\build\verify_heif_wic.exe'
     'install.ps1'         = Join-Path $root 'heif-wic\install.ps1'
     'uninstall.ps1'       = Join-Path $root 'heif-wic\uninstall.ps1'
