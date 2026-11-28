@@ -16,6 +16,15 @@ pub struct HeifWicDecoded {
     pub icc_len: usize,
 }
 
+#[repr(C)]
+pub struct HeifWicProbed {
+    pub width: u32,
+    pub height: u32,
+    pub bits_per_channel: u32,
+    pub icc_ptr: *mut u8,
+    pub icc_len: usize,
+}
+
 #[inline]
 fn linear_to_srgb(v: f32) -> f32 {
     let v = v.clamp(0.0, 1.0);
@@ -738,6 +747,71 @@ pub unsafe extern "C" fn heif_wic_decode(
         HEIF_GAMUT_DISPLAY_P3,
         out,
     )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn heif_wic_probe(
+    input_ptr: *const u8,
+    input_len: usize,
+    out: *mut HeifWicProbed,
+) -> i32 {
+    if input_ptr.is_null() || input_len == 0 || out.is_null() {
+        return -1;
+    }
+
+    let bytes = slice::from_raw_parts(input_ptr, input_len);
+    let Ok(info) = heic_decoder::probe(bytes) else {
+        return -2;
+    };
+    if info.width == 0 || info.height == 0 {
+        return -2;
+    }
+
+    let icc_vec = match heic_decoder::read_metadata(bytes) {
+        Ok(meta) => {
+            if let Some(icc) = meta.icc_profile {
+                Some(icc)
+            } else {
+                match meta.color_info.map(|c| c.color_primaries) {
+                    Some(9) | Some(12) => Some(display_p3_icc_profile().to_vec()),
+                    _ => None,
+                }
+            }
+        }
+        Err(_) => None,
+    };
+
+    let (icc_ptr, icc_len) = if let Some(mut icc) = icc_vec {
+        let len = icc.len();
+        let ptr = icc.as_mut_ptr();
+        std::mem::forget(icc);
+        (ptr, len)
+    } else {
+        (ptr::null_mut(), 0)
+    };
+
+    *out = HeifWicProbed {
+        width: info.width as u32,
+        height: info.height as u32,
+        bits_per_channel: 8,
+        icc_ptr,
+        icc_len,
+    };
+
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn heif_wic_probe_free(probed: *mut HeifWicProbed) {
+    if probed.is_null() {
+        return;
+    }
+    let p = &mut *probed;
+    if !p.icc_ptr.is_null() && p.icc_len > 0 {
+        let _ = Vec::from_raw_parts(p.icc_ptr, p.icc_len, p.icc_len);
+        p.icc_ptr = ptr::null_mut();
+        p.icc_len = 0;
+    }
 }
 
 #[no_mangle]

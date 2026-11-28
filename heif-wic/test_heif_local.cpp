@@ -60,7 +60,11 @@ static void run_case(IClassFactory* cf, const wchar_t* path) {
 
             std::vector<BYTE> row10(w * bpp);
             WICRect rc10 = {0, (INT)(h / 10), (INT)w, 1};
+            LARGE_INTEGER cp0, cp1;
+            QueryPerformanceCounter(&cp0);
             HRESULT hrCp = frame->CopyPixels(&rc10, w * bpp, (UINT)row10.size(), row10.data());
+            QueryPerformanceCounter(&cp1);
+            double cpMs = (double)(cp1.QuadPart - cp0.QuadPart) * 1000.0 / (double)freq.QuadPart;
             size_t mid = (w / 2) * bpp;
 
             HRESULT hrConv = S_OK;
@@ -82,11 +86,11 @@ static void run_case(IClassFactory* cf, const wchar_t* path) {
 
             if (is64) {
                 const UINT16* px = (const UINT16*)(row10.data() + mid);
-                printf("  Size=%ux%u, fmt=64bppBGRA(16bit), ICC=%u(%uB), CopyPixels=0x%08lx, Conv32=0x%08lx, RGB16(10%%,50%%)=(%u,%u,%u), MQR=0x%08lx Ori=%u\n",
-                       w, h, iccCnt, iccBytes, hrCp, hrConv, px[2], px[1], px[0], hrMq, (unsigned)pv.uiVal);
+                printf("  Size=%ux%u, fmt=64bppBGRA(16bit), ICC=%u(%uB), CopyPixels=0x%08lx(%.1f ms), Conv32=0x%08lx, RGB16(10%%,50%%)=(%u,%u,%u), MQR=0x%08lx Ori=%u\n",
+                       w, h, iccCnt, iccBytes, hrCp, cpMs, hrConv, px[2], px[1], px[0], hrMq, (unsigned)pv.uiVal);
             } else {
-                printf("  Size=%ux%u, fmt=32bppBGRA(8bit), ICC=%u(%uB), CopyPixels=0x%08lx, RGB8(10%%,50%%)=(%u,%u,%u), MQR=0x%08lx Ori=%u\n",
-                       w, h, iccCnt, iccBytes, hrCp, row10[mid+2], row10[mid+1], row10[mid], hrMq, (unsigned)pv.uiVal);
+                printf("  Size=%ux%u, fmt=32bppBGRA(8bit), ICC=%u(%uB), CopyPixels=0x%08lx(%.1f ms), RGB8(10%%,50%%)=(%u,%u,%u), MQR=0x%08lx Ori=%u\n",
+                       w, h, iccCnt, iccBytes, hrCp, cpMs, row10[mid+2], row10[mid+1], row10[mid], hrMq, (unsigned)pv.uiVal);
             }
             PropVariantClear(&pv);
             if (mqr) mqr->Release();

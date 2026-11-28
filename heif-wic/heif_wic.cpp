@@ -21,6 +21,16 @@ struct HeifWicDecoded {
     size_t icc_len;
 };
 
+struct HeifWicProbed {
+    uint32_t width;
+    uint32_t height;
+    uint32_t bits_per_channel;
+    uint8_t* icc_ptr;
+    size_t icc_len;
+};
+
+int32_t heif_wic_probe(const uint8_t* input_ptr, size_t input_len, HeifWicProbed* out);
+void heif_wic_probe_free(HeifWicProbed* probed);
 int32_t heif_wic_decode(const uint8_t* input_ptr, size_t input_len, HeifWicDecoded* out);
 void heif_wic_free(HeifWicDecoded* decoded);
 }
@@ -150,10 +160,40 @@ static void PinSelfModuleOnce() {
     InitOnceExecuteOnce(&g_pinOnce, PinSelfModuleCallback, NULL, NULL);
 }
 
-struct DecodedHolder {
+struct LazyImageState {
+    CRITICAL_SECTION cs;
+    std::vector<uint8_t> raw_bytes;
+    HeifWicProbed probed;
     HeifWicDecoded dec;
-    DecodedHolder() { memset(&dec, 0, sizeof(dec)); }
-    ~DecodedHolder() { heif_wic_free(&dec); }
+    bool decoded;
+    HRESULT decode_hr;
+
+    LazyImageState() : decoded(false), decode_hr(S_OK) {
+        InitializeCriticalSection(&cs);
+        memset(&probed, 0, sizeof(probed));
+        memset(&dec, 0, sizeof(dec));
+    }
+    ~LazyImageState() {
+        heif_wic_free(&dec);
+        heif_wic_probe_free(&probed);
+        DeleteCriticalSection(&cs);
+    }
+
+    // Defer full HEVC pixel decode until CopyPixels is actually requested so metadata-only
+    // callers (e.g. Explorer context menu / PhotoViewer.dll) return in ~1-3 ms.
+    HRESULT EnsureDecoded() {
+        EnterCriticalSection(&cs);
+        if (!decoded) {
+            PinSelfModuleOnce();
+            int32_t rc = heif_wic_decode(raw_bytes.data(), raw_bytes.size(), &dec);
+            std::vector<uint8_t>().swap(raw_bytes);
+            decode_hr = (rc == 0 && dec.bgra_ptr) ? S_OK : WINCODEC_ERR_BADIMAGE;
+            decoded = true;
+        }
+        HRESULT hr = decode_hr;
+        LeaveCriticalSection(&cs);
+        return hr;
+    }
 };
 
 static bool IsBrand(const uint8_t* b, const char* tag) {
@@ -207,25 +247,38 @@ static bool ReadAllStream(IStream* pStream, std::vector<uint8_t>& out) {
     out.clear();
     STATSTG st = {};
     if (SUCCEEDED(pStream->Stat(&st, STATFLAG_NONAME)) && st.cbSize.QuadPart > 0 && st.cbSize.QuadPart <= MAX_HEIF_BYTES) {
-        out.reserve((size_t)st.cbSize.QuadPart);
+        size_t expected = (size_t)st.cbSize.QuadPart;
+        out.resize(expected);
+        size_t offset = 0;
+        while (offset < expected) {
+            ULONG toRead = (ULONG)((expected - offset) > (1024u * 1024u) ? (1024u * 1024u) : (expected - offset));
+            ULONG n = 0;
+            HRESULT hr = pStream->Read(out.data() + offset, toRead, &n);
+            if (FAILED(hr)) return false;
+            if (n == 0) break;
+            offset += n;
+            if (hr == S_FALSE) break;
+        }
+        out.resize(offset);
+        return !out.empty();
     }
 
-    uint8_t chunk[65536];
+    std::vector<uint8_t> chunk(262144);
     while (true) {
         ULONG n = 0;
-        HRESULT hr = pStream->Read(chunk, sizeof(chunk), &n);
+        HRESULT hr = pStream->Read(chunk.data(), (ULONG)chunk.size(), &n);
         if (FAILED(hr)) return false;
         if (n == 0) break;
         if (out.size() + n > MAX_HEIF_BYTES) return false;
-        out.insert(out.end(), chunk, chunk + n);
+        out.insert(out.end(), chunk.begin(), chunk.begin() + n);
         if (hr == S_FALSE) break;
     }
     return !out.empty();
 }
 
-static HRESULT FillColorContexts(const HeifWicDecoded& dec, UINT cCount, IWICColorContext** ppIColorContexts, UINT* pcActualCount) {
+static HRESULT FillColorContextsFromBytes(const uint8_t* icc_ptr, size_t icc_len, UINT cCount, IWICColorContext** ppIColorContexts, UINT* pcActualCount) {
     if (!pcActualCount) return E_INVALIDARG;
-    if (!dec.icc_ptr || dec.icc_len == 0) {
+    if (!icc_ptr || icc_len == 0) {
         *pcActualCount = 0;
         return S_OK;
     }
@@ -239,15 +292,24 @@ static HRESULT FillColorContexts(const HeifWicDecoded& dec, UINT cCount, IWICCol
     if (!ppIColorContexts[0]) {
         return E_INVALIDARG;
     }
-    return ppIColorContexts[0]->InitializeFromMemory(dec.icc_ptr, (UINT)dec.icc_len);
+    return ppIColorContexts[0]->InitializeFromMemory(icc_ptr, (UINT)icc_len);
+}
+
+static HRESULT FillColorContexts(LazyImageState& st, UINT cCount, IWICColorContext** ppIColorContexts, UINT* pcActualCount) {
+    EnterCriticalSection(&st.cs);
+    const uint8_t* icc_ptr = (st.decoded && SUCCEEDED(st.decode_hr)) ? st.dec.icc_ptr : st.probed.icc_ptr;
+    size_t icc_len = (st.decoded && SUCCEEDED(st.decode_hr)) ? st.dec.icc_len : st.probed.icc_len;
+    HRESULT hr = FillColorContextsFromBytes(icc_ptr, icc_len, cCount, ppIColorContexts, pcActualCount);
+    LeaveCriticalSection(&st.cs);
+    return hr;
 }
 
 class HeifFrameDecode : public IWICBitmapFrameDecode {
     volatile LONG m_ref;
-    std::shared_ptr<DecodedHolder> m_holder;
+    std::shared_ptr<LazyImageState> m_state;
 public:
-    HeifFrameDecode(std::shared_ptr<DecodedHolder> holder)
-        : m_ref(1), m_holder(std::move(holder)) {
+    HeifFrameDecode(std::shared_ptr<LazyImageState> state)
+        : m_ref(1), m_state(std::move(state)) {
         InterlockedIncrement(&g_objCount);
     }
     virtual ~HeifFrameDecode() {
@@ -274,14 +336,14 @@ public:
 
     HRESULT STDMETHODCALLTYPE GetSize(UINT* puiWidth, UINT* puiHeight) override {
         if (!puiWidth || !puiHeight) return E_INVALIDARG;
-        *puiWidth = m_holder->dec.width;
-        *puiHeight = m_holder->dec.height;
+        *puiWidth = m_state->probed.width;
+        *puiHeight = m_state->probed.height;
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE GetPixelFormat(WICPixelFormatGUID* pPixelFormat) override {
         if (!pPixelFormat) return E_INVALIDARG;
-        *pPixelFormat = (m_holder->dec.bits_per_channel == 16)
+        *pPixelFormat = (m_state->probed.bits_per_channel == 16)
                             ? GUID_WICPixelFormat64bppBGRA
                             : GUID_WICPixelFormat32bppBGRA;
         return S_OK;
@@ -300,7 +362,10 @@ public:
 
     HRESULT STDMETHODCALLTYPE CopyPixels(const WICRect* prc, UINT cbStride, UINT cbBufferSize, BYTE* pbBuffer) override {
         if (!pbBuffer) return E_INVALIDARG;
-        const auto& dec = m_holder->dec;
+        HRESULT hr = m_state->EnsureDecoded();
+        if (FAILED(hr)) return hr;
+
+        const auto& dec = m_state->dec;
         WICRect rc = { 0, 0, (INT)dec.width, (INT)dec.height };
         if (prc) rc = *prc;
 
@@ -330,7 +395,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE GetColorContexts(UINT cCount, IWICColorContext** ppIColorContexts, UINT* pcActualCount) override {
-        return FillColorContexts(m_holder->dec, cCount, ppIColorContexts, pcActualCount);
+        return FillColorContexts(*m_state, cCount, ppIColorContexts, pcActualCount);
     }
 
     HRESULT STDMETHODCALLTYPE GetThumbnail(IWICBitmapSource** ppIThumbnail) override {
@@ -342,7 +407,7 @@ public:
 class HeifDecoder : public IWICBitmapDecoder {
     volatile LONG m_ref;
     CRITICAL_SECTION m_cs;
-    std::shared_ptr<DecodedHolder> m_holder;
+    std::shared_ptr<LazyImageState> m_state;
 public:
     HeifDecoder() : m_ref(1) {
         InitializeCriticalSection(&m_cs);
@@ -385,20 +450,22 @@ public:
 
     HRESULT STDMETHODCALLTYPE Initialize(IStream* pIStream, WICDecodeOptions) override {
         if (!pIStream) return E_INVALIDARG;
-        std::vector<uint8_t> bytes;
-        if (!ReadAllStream(pIStream, bytes)) {
+        if (!CheckHeifStreamHeader(pIStream)) {
+            return WINCODEC_ERR_BADHEADER;
+        }
+
+        auto state = std::make_shared<LazyImageState>();
+        if (!ReadAllStream(pIStream, state->raw_bytes)) {
             return WINCODEC_ERR_STREAMREAD;
         }
 
-        auto holder = std::make_shared<DecodedHolder>();
-        PinSelfModuleOnce();
-        int32_t rc = heif_wic_decode(bytes.data(), bytes.size(), &holder->dec);
+        int32_t rc = heif_wic_probe(state->raw_bytes.data(), state->raw_bytes.size(), &state->probed);
         if (rc != 0) {
             return WINCODEC_ERR_BADHEADER;
         }
 
         EnterCriticalSection(&m_cs);
-        m_holder = std::move(holder);
+        m_state = std::move(state);
         LeaveCriticalSection(&m_cs);
         return S_OK;
     }
@@ -442,10 +509,10 @@ public:
 
     HRESULT STDMETHODCALLTYPE GetColorContexts(UINT cCount, IWICColorContext** ppIColorContexts, UINT* pcActualCount) override {
         EnterCriticalSection(&m_cs);
-        auto holder = m_holder;
+        auto state = m_state;
         LeaveCriticalSection(&m_cs);
-        if (!holder) return WINCODEC_ERR_NOTINITIALIZED;
-        return FillColorContexts(holder->dec, cCount, ppIColorContexts, pcActualCount);
+        if (!state) return WINCODEC_ERR_NOTINITIALIZED;
+        return FillColorContexts(*state, cCount, ppIColorContexts, pcActualCount);
     }
 
     HRESULT STDMETHODCALLTYPE GetThumbnail(IWICBitmapSource** ppIThumbnail) override {
@@ -463,11 +530,11 @@ public:
         if (!ppIBitmapFrame) return E_INVALIDARG;
         *ppIBitmapFrame = NULL;
         EnterCriticalSection(&m_cs);
-        auto holder = m_holder;
+        auto state = m_state;
         LeaveCriticalSection(&m_cs);
-        if (!holder) return WINCODEC_ERR_NOTINITIALIZED;
+        if (!state) return WINCODEC_ERR_NOTINITIALIZED;
         if (index != 0) return WINCODEC_ERR_FRAMEMISSING;
-        HeifFrameDecode* frame = new (std::nothrow) HeifFrameDecode(std::move(holder));
+        HeifFrameDecode* frame = new (std::nothrow) HeifFrameDecode(std::move(state));
         if (!frame) return E_OUTOFMEMORY;
         *ppIBitmapFrame = frame;
         return S_OK;
